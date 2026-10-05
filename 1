@@ -1,41 +1,22 @@
 """
-Unified anomaly detector for forecast vs actual time series.
+Anomaly detection for forecast-vs-actual time series across many customers.
 
-Detects three types of anomalies across many customers/forecasts:
-
-  1. WORK_HOLIDAY  — consecutive days where actual/forecast ratio is way off
-                     (e.g. customer shuts down for a week)
-  2. WEIRD_WEEKEND — weekends where actual deviates from normal weekend pattern
-                     (e.g. weekend that looks like a workday, or unusual dip)
-  3. STRUCTURAL_BREAK — permanent shift in the demand baseline
-                     (detected via ruptures PELT change-point detection)
+Detects:
+  1. WORK_HOLIDAY     — consecutive days where actual/forecast ratio is way off
+  2. STRUCTURAL_BREAK — permanent baseline shifts (via ruptures PELT)
 
 Usage
 -----
-    from anomaly_detector import detect_anomalies
+    from anomaly_detector import detect_anomalies, print_report
 
     result = detect_anomalies(df)
-
-    # result is a dict with keys:
-    #   'holidays'       — DataFrame of WORK_HOLIDAY blocks
-    #   'weekends'       — DataFrame of WEIRD_WEEKEND events
-    #   'breaks'         — DataFrame of STRUCTURAL_BREAK events
-    #   'diagnostics'    — per-row data with flags
-
-    # Or with custom parameters:
-    result = detect_anomalies(
-        df,
-        freq='D',
-        holiday_ratio_thresh=0.5,
-        holiday_min_consecutive=3,
-        weekend_z_thresh=2.5,
-        break_penalty='auto',
-    )
+    # result['holidays']   — DataFrame of WORK_HOLIDAY blocks
+    # result['breaks']     — DataFrame of STRUCTURAL_BREAK events
+    # result['diagnostics']— per-row flags
 
 Input DataFrame
 ---------------
-  Must have columns: customer_id, date (datetime), forecast (float), actual (float).
-  One row per day (or hour) per customer.
+  customer_id | date (datetime) | forecast (float) | actual (float)
 """
 
 from __future__ import annotations
@@ -44,13 +25,13 @@ import numpy as np
 import pandas as pd
 import ruptures as rpt
 
+
 # ---------------------------------------------------------------------------
-# Helper utilities
+# Helpers
 # ---------------------------------------------------------------------------
 
 
 def _rolling_mad_z(series: pd.Series, window: int) -> pd.Series:
-    """Rolling z-score via Median + MAD (robust to outliers in baseline)."""
     roll = series.rolling(window=window, min_periods=max(5, window // 4))
     med = roll.median()
     mad = roll.apply(
@@ -59,10 +40,8 @@ def _rolling_mad_z(series: pd.Series, window: int) -> pd.Series:
     return ((series - med) / mad.replace(0, np.nan)).fillna(0.0)
 
 
-def _block_finder(
-    mask: np.ndarray, dates: np.ndarray, zs: np.ndarray, min_run: int
-) -> pd.DataFrame:
-    """Group consecutive ``True`` in mask, keep runs >= min_run."""
+def _find_blocks(mask, dates, zs, min_run):
+    """Group consecutive True in mask, keep runs >= min_run."""
     rows, n = [], len(mask)
     i = 0
     while i < n:
@@ -94,64 +73,63 @@ def _block_finder(
 # ---------------------------------------------------------------------------
 
 
-def _analyze_one(
-    cid: str,
+def analyze_customer(
     df: pd.DataFrame,
-    freq: str,
-    holiday_ratio_thresh: float,
-    holiday_min_consecutive: int,
-    weekend_z_thresh: float,
-    break_penalty: float | str,
+    freq: str = "D",
+    ratio_thresh: float = 0.5,
+    min_consecutive: int = 3,
+    break_penalty: float = 8.0,
 ) -> dict:
     """
-    Run all three anomaly detectors on a single customer's data.
+    Analyze a single customer's forecast-vs-actual data.
 
-    Returns
-    -------
-    dict with keys: holidays, weekends, breaks, diagnostics
+    Parameters
+    ----------
+    df : DataFrame with columns [date, forecast, actual], sorted by date.
+    freq : 'D' or 'h'
+    ratio_thresh : flag point as "off" when |actual/forecast - 1| > thresh
+    min_consecutive : min consecutive off-days to form a WORK_HOLIDAY
+    break_penalty : ruptures PELT penalty (higher = fewer breaks)
+
+    Returns dict with keys: holidays, breaks, diagnostics, bkps
     """
     n = len(df)
-    f = df["forecast"].to_numpy()
-    a = df["actual"].to_numpy()
+    f = df["forecast"].to_numpy().astype(float)
+    a = df["actual"].to_numpy().astype(float)
     dates = df["date"].to_numpy()
 
-    # Residual-based signals
     resid = a - f
     ratio = np.where(np.abs(f) > 1e-9, a / f, np.where(np.abs(a) > 1e-9, 2.0, 1.0))
 
-    # Rolling z-score on residuals for diagnostics
+    # Rolling z-score on residuals
     win = 28 * 24 if freq == "h" else 14
     zs = _rolling_mad_z(pd.Series(resid, index=df.index), window=win).to_numpy()
 
-    # ---- 1. WORK HOLIDAY detection (ratio-based) ----
-    ratio_off = (ratio < 1 - holiday_ratio_thresh) | (
-        ratio > 1 + holiday_ratio_thresh
-    )
+    # ---- 1. WORK HOLIDAY (ratio-based) ----
+    ratio_off = (ratio < 1 - ratio_thresh) | (ratio > 1 + ratio_thresh)
 
     if freq == "h":
         days = pd.Series(dates).dt.normalize().to_numpy()
         day_df = pd.DataFrame({"d": days, "off": ratio_off})
-        daily = day_df.groupby("d").agg(
-            total=("off", "size"), off_count=("off", "sum")
-        ).reset_index()
-        # Require at least 50% of hours off for the day to count
+        daily = (
+            day_df.groupby("d")
+            .agg(total=("off", "size"), off_count=("off", "sum"))
+            .reset_index()
+        )
         daily["is_off"] = (daily["off_count"] >= 2) & (
             daily["off_count"] >= 0.5 * daily["total"]
         )
         day_dates = daily["d"].to_numpy()
         day_off = daily["is_off"].to_numpy()
-        # Use per-day max z for diagnostics
-        day_z = day_df.assign(az=np.abs(zs)).groupby("d")["az"].max().to_numpy()
-        holiday_blocks = _block_finder(
-            day_off, day_dates, day_z, holiday_min_consecutive
+        day_z = (
+            day_df.assign(az=np.abs(zs)).groupby("d")["az"].max().to_numpy()
         )
+        holiday_blocks = _find_blocks(day_off, day_dates, day_z, min_consecutive)
         in_holiday = np.zeros(n, dtype=bool)
         for _, r in holiday_blocks.iterrows():
             in_holiday |= (days >= r["start"]) & (days <= r["end"])
     else:
-        holiday_blocks = _block_finder(
-            ratio_off, dates, zs, holiday_min_consecutive
-        )
+        holiday_blocks = _find_blocks(ratio_off, dates, zs, min_consecutive)
         in_holiday = np.zeros(n, dtype=bool)
         for _, r in holiday_blocks.iterrows():
             in_holiday |= (dates >= r["start"]) & (dates <= r["end"])
@@ -159,190 +137,84 @@ def _analyze_one(
     holidays_out = pd.DataFrame()
     if not holiday_blocks.empty:
         holidays_out = holiday_blocks.copy()
-        holidays_out.insert(0, "customer_id", cid)
         holidays_out["type"] = "WORK_HOLIDAY"
 
-    # ---- 2. WEIRD WEEKEND detection ----
-    # A "weird" weekend is one whose actual/forecast ratio deviates from
-    # the rolling pattern of recent weekends (last 12 weekends).
-    # Uses a centered rolling median + MAD so structural shifts don't
-    # cause every subsequent weekend to look "weird".
-    weekends_out = pd.DataFrame()
-    if freq == "D":
-        dow = df["date"].dt.dayofweek
-        is_weekend = dow >= 5
-        weekend_indices = np.where(is_weekend)[0]
+    # ---- 2. STRUCTURAL BREAK via ruptures PELT ----
+    y_scaled = (resid - np.median(resid)) / (np.std(resid) + 1e-8)
 
-        if len(weekend_indices) >= 8:
-            # Build per-weekend median ratio
-            wk_nrs = df["date"].dt.isocalendar().week.to_numpy()
-            yr_nrs = df["date"].dt.isocalendar().year.to_numpy()
-            groups = []
-            cur_key = None
-            for idx in weekend_indices:
-                key = (yr_nrs[idx], wk_nrs[idx])
-                if cur_key is None or key != cur_key:
-                    if cur_key is not None and grp_rats:
-                        groups.append(
-                            {
-                                "idx": idx,
-                                "start": grp_start, "end": grp_end,
-                                "ratio_median": float(np.median(grp_rats)),
-                                "first_dow": int(pd.Timestamp(grp_start).dayofweek),
-                            }
-                        )
-                    cur_key = key
-                    grp_rats = []
-                    grp_start = dates[idx]
-                grp_rats.append(ratio[idx])
-                grp_end = dates[idx]
-            if cur_key is not None and grp_rats:
-                groups.append(
-                    {
-                        "idx": idx,
-                        "start": grp_start, "end": grp_end,
-                        "ratio_median": float(np.median(grp_rats)),
-                        "first_dow": int(pd.Timestamp(grp_start).dayofweek),
-                    }
-                )
+    algo = rpt.Pelt(model="l2")
+    algo.fit(y_scaled)
+    bkps = algo.predict(pen=break_penalty)
+    break_indices = bkps[:-1]  # last element is n (endpoint)
 
-            if len(groups) >= 6:
-                wg = pd.DataFrame(groups)
-                # Rolling window: 12-week centered window for baseline
-                roll_med = wg["ratio_median"].rolling(12, center=True, min_periods=4).median()
-                # Rolling MAD
-                def _rolling_mad(s, w):
-                    return s.rolling(w, center=True, min_periods=4).apply(
-                        lambda x: 1.4826 * np.median(np.abs(x - np.median(x))), raw=True
-                    )
-                roll_mad = _rolling_mad(wg["ratio_median"], 12).fillna(1.0)
-                roll_mad = roll_mad.replace(0, np.nan).fillna(1.0)
-
-                wg["weekend_z"] = (wg["ratio_median"] - roll_med) / roll_mad
-
-                # Flag: |z| > thresh AND ratio deviates meaningfully from 1.0
-                weird = wg[
-                    (np.abs(wg["weekend_z"]) >= weekend_z_thresh)
-                    & (np.abs(wg["ratio_median"] - 1.0) > 0.08)
-                ].copy()
-                if not weird.empty:
-                    weird.insert(0, "customer_id", cid)
-                    weird["type"] = "WEIRD_WEEKEND"
-                    weird["direction"] = np.where(
-                        weird["weekend_z"] > 0, "high", "low"
-                    )
-                    weekends_out = weird.reset_index(drop=True)
-
-    # ---- 3. STRUCTURAL BREAK detection (via ruptures PELT) ----
-    # Aggregate residuals weekly to reduce noise, then run PELT
     breaks_out = pd.DataFrame()
-    df_wk = df.copy()
-    df_wk["resid"] = resid
-    df_wk["wk"] = df_wk["date"].dt.isocalendar().week.astype(int)
-    df_wk["yr"] = df_wk["date"].dt.isocalendar().year.astype(int)
-    weekly = df_wk.groupby(["yr", "wk"])["resid"].sum().reset_index(drop=True)
-
-    if len(weekly) >= 8:
-        y = weekly.to_numpy()
-
-        # Auto-penalty: BIC-inspired. Larger penalty = fewer breaks.
-        if isinstance(break_penalty, str) and break_penalty == "auto":
-            pen = np.std(y) * 2.0 * np.log(len(y))
-        else:
-            pen = float(break_penalty)
-
-        algo = rpt.Pelt(model="l2", min_size=2, jump=1).fit(y)
-        bkps = algo.predict(pen=pen)
-        break_weeks = bkps[:-1]  # last entry is n_samples (endpoint)
-
-        if break_weeks:
-            rows = []
-            # Exclude breaks in first/last 2 weeks (startup / truncation noise)
-            for bw in break_weeks:
-                if bw < 2 or bw >= len(y) - 2:
-                    continue
-                day_idx = int(bw * 7)
-                if day_idx >= n:
-                    day_idx = n - 1
-                before = resid[max(0, day_idx - 21) : day_idx]
-                after = resid[day_idx : min(n, day_idx + 21)]
-                med_before = float(np.median(before)) if len(before) else 0.0
-                med_after = float(np.median(after)) if len(after) else 0.0
-                # Only report if the shift is meaningful (> 5% of forecast scale)
-                scale = float(np.median(np.abs(f)))
-                if scale > 1e-9 and abs(med_after - med_before) < 0.05 * scale:
-                    continue
-                rows.append(
-                    {
-                        "customer_id": cid,
-                        "date": df["date"].iloc[day_idx],
-                        "type": "STRUCTURAL_BREAK",
-                        "direction": "up" if med_after > med_before else "down",
-                        "magnitude": round(abs(med_after - med_before), 2),
-                        "mean_before": round(med_before, 2),
-                        "mean_after": round(med_after, 2),
-                    }
-                )
-            breaks_out = pd.DataFrame(rows) if rows else pd.DataFrame()
+    if len(break_indices) > 0:
+        rows = []
+        scale = float(np.median(np.abs(f))) if float(np.median(np.abs(f))) > 0 else 1.0
+        for bi in break_indices:
+            if bi < 2 or bi >= n - 2:
+                continue
+            before = resid[max(0, bi - 21) : bi]
+            after = resid[bi : min(n, bi + 21)]
+            med_before = float(np.median(before)) if len(before) else 0.0
+            med_after = float(np.median(after)) if len(after) else 0.0
+            if abs(med_after - med_before) < 0.05 * scale:
+                continue
+            rows.append(
+                {
+                    "date": dates[bi],
+                    "type": "STRUCTURAL_BREAK",
+                    "direction": "up" if med_after > med_before else "down",
+                    "magnitude": round(abs(med_after - med_before), 2),
+                    "mean_before": round(med_before, 2),
+                    "mean_after": round(med_after, 2),
+                }
+            )
+        breaks_out = pd.DataFrame(rows) if rows else pd.DataFrame()
 
     # ---- Diagnostics ----
     diagnostics = df[["date", "forecast", "actual"]].copy()
-    diagnostics["customer_id"] = cid
     diagnostics["residual"] = resid.round(2)
     diagnostics["ratio"] = ratio.round(3)
     diagnostics["zscore"] = zs.round(2)
     diagnostics["is_off"] = ratio_off
     diagnostics["is_holiday"] = in_holiday
-    diagnostics["is_weekend"] = dow >= 5 if freq == "D" else False
 
     return {
         "holidays": holidays_out,
-        "weekends": weekends_out,
         "breaks": breaks_out,
         "diagnostics": diagnostics,
+        "bkps": break_indices,
     }
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Multi-customer wrapper
 # ---------------------------------------------------------------------------
 
 
 def detect_anomalies(
     df: pd.DataFrame,
     freq: str = "D",
-    holiday_ratio_thresh: float = 0.5,
-    holiday_min_consecutive: int = 3,
-    weekend_z_thresh: float = 2.5,
-    break_penalty: float | str = "auto",
+    ratio_thresh: float = 0.5,
+    min_consecutive: int = 3,
+    break_penalty: float = 8.0,
 ) -> dict:
     """
-    Detect work holidays, weird weekends, and structural breaks in
-    forecast-vs-actual time series.
+    Run anomaly detection across all customers in a DataFrame.
 
     Parameters
     ----------
-    df : pd.DataFrame
-        Must have columns: customer_id, date (datetime), forecast, actual.
-    freq : str
-        'D' (daily) or 'h' (hourly). Weekend detection only works with 'D'.
-    holiday_ratio_thresh : float
-        actual/forecast < 1-thresh or > 1+thresh flags as "off" (default 0.5).
-    holiday_min_consecutive : int
-        Minimum consecutive off-days to count as a WORK_HOLIDAY (default 3).
-    weekend_z_thresh : float
-        MAD z-score threshold for a weekend to be "weird" (default 2.5).
-    break_penalty : float or 'auto'
-        ruptures PELT penalty. 'auto' computes a BIC-inspired penalty
-        (default). Larger value = fewer breaks.
+    df : DataFrame with columns [customer_id, date, forecast, actual]
+    freq : 'D' or 'h'
+    ratio_thresh : threshold for |actual/forecast - 1|
+    min_consecutive : min off-days for a WORK_HOLIDAY block
+    break_penalty : ruptures PELT penalty (default 8.0)
 
-    Returns
-    -------
-    dict with keys:
-        'holidays'    — DataFrame of WORK_HOLIDAY blocks
-        'weekends'    — DataFrame of WEIRD_WEEKEND events
-        'breaks'      — DataFrame of STRUCTURAL_BREAK events
-        'diagnostics' — per-row data with flags
+    Returns dict with keys:
+        'holidays'   — all WORK_HOLIDAY blocks concatenated
+        'breaks'     — all STRUCTURAL_BREAK events concatenated
+        'diagnostics'— per-row data with flags
     """
     required = {"customer_id", "date", "forecast", "actual"}
     missing = required - set(df.columns)
@@ -353,77 +225,129 @@ def detect_anomalies(
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values(["customer_id", "date"])
 
-    all_holidays: list[pd.DataFrame] = []
-    all_weekends: list[pd.DataFrame] = []
-    all_breaks: list[pd.DataFrame] = []
-    all_diag: list[pd.DataFrame] = []
+    all_holidays, all_breaks, all_diag = [], [], []
 
     for cid, grp in df.groupby("customer_id", sort=False):
         grp = grp.reset_index(drop=True)
-        out = _analyze_one(
-            cid,
-            grp,
-            freq,
-            holiday_ratio_thresh,
-            holiday_min_consecutive,
-            weekend_z_thresh,
-            break_penalty,
+        out = analyze_customer(
+            grp, freq, ratio_thresh, min_consecutive, break_penalty,
         )
-        all_diag.append(out["diagnostics"])
+        d = out["diagnostics"].copy()
+        d["customer_id"] = cid
+        all_diag.append(d)
         if not out["holidays"].empty:
-            all_holidays.append(out["holidays"])
-        if not out["weekends"].empty:
-            all_weekends.append(out["weekends"])
+            h = out["holidays"].copy()
+            h.insert(0, "customer_id", cid)
+            all_holidays.append(h)
         if not out["breaks"].empty:
-            all_breaks.append(out["breaks"])
+            b = out["breaks"].copy()
+            b.insert(0, "customer_id", cid)
+            all_breaks.append(b)
 
     return {
-        "holidays": pd.concat(all_holidays, ignore_index=True) if all_holidays else pd.DataFrame(),
-        "weekends": pd.concat(all_weekends, ignore_index=True) if all_weekends else pd.DataFrame(),
-        "breaks": pd.concat(all_breaks, ignore_index=True) if all_breaks else pd.DataFrame(),
-        "diagnostics": pd.concat(all_diag, ignore_index=True) if all_diag else pd.DataFrame(),
+        "holidays": pd.concat(all_holidays, ignore_index=True)
+        if all_holidays
+        else pd.DataFrame(),
+        "breaks": pd.concat(all_breaks, ignore_index=True)
+        if all_breaks
+        else pd.DataFrame(),
+        "diagnostics": pd.concat(all_diag, ignore_index=True)
+        if all_diag
+        else pd.DataFrame(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+
+
+def plot_customer(
+    result: dict,
+    customer_id: str,
+    save: str | None = None,
+    figsize=(14, 5),
+):
+    """Plot one customer: scaled residual + PELT break lines + holiday bands."""
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+
+    diag = result["diagnostics"]
+    cust = diag[diag["customer_id"] == customer_id].copy()
+    if cust.empty:
+        print(f"No data for customer '{customer_id}'")
+        return
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    y = cust["residual"].values.astype(float)
+    y_scaled = (y - np.median(y)) / (np.std(y) + 1e-8)
+    ax.plot(cust["date"], y_scaled, "b-", linewidth=0.8, label="Scaled residual")
+
+    # PELT breaks
+    ys = (y - np.median(y)) / (np.std(y) + 1e-8)
+    algo = rpt.Pelt(model="l2").fit(ys)
+    bkps = algo.predict(pen=8)[:-1]
+    for bi in bkps:
+        if bi < len(cust):
+            ax.axvline(cust["date"].iloc[bi], color="red", linestyle="--",
+                       linewidth=1, alpha=0.7)
+    if bkps:
+        ax.text(0.02, 0.95, f"PELT breaks: {len(bkps)}",
+                transform=ax.transAxes, fontsize=9, va="top",
+                bbox=dict(facecolor="wheat", alpha=0.7))
+
+    # Holiday bands
+    holidays = result["holidays"]
+    if not holidays.empty:
+        for _, row in holidays[holidays["customer_id"] == customer_id].iterrows():
+            ax.axvspan(row["start"], row["end"], color="green", alpha=0.15)
+
+    # Structural breaks
+    breaks = result["breaks"]
+    if not breaks.empty:
+        for _, row in breaks[breaks["customer_id"] == customer_id].iterrows():
+            ax.axvline(row["date"], color="red", linewidth=2, alpha=0.8)
+
+    ax.axhline(0, color="gray", linewidth=0.5)
+    ax.set_title(f"Customer {customer_id}")
+    ax.set_ylabel("Scaled residual")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+    ax.legend(fontsize=8, loc="upper right")
+    plt.tight_layout()
+
+    if save:
+        plt.savefig(save, dpi=150)
+        print(f"Saved to {save}")
+    else:
+        plt.show()
+    plt.close()
 
 
 def print_report(result: dict) -> None:
     """Pretty-print all detected anomalies."""
-    h = result["holidays"]
-    w = result["weekends"]
-    b = result["breaks"]
-    d = result["diagnostics"]
-
+    h, b, d = result["holidays"], result["breaks"], result["diagnostics"]
     n_cust = d["customer_id"].nunique() if not d.empty else 0
     sep = "=" * 72
     print(sep)
-    print(f"  CUSTOMERS:       {n_cust}")
-    print(f"  WORK HOLIDAYS:   {len(h)}")
-    print(f"  WEIRD WEEKENDS:  {len(w)}")
+    print(f"  CUSTOMERS:         {n_cust}")
+    print(f"  WORK HOLIDAYS:     {len(h)}")
     print(f"  STRUCTURAL BREAKS: {len(b)}")
     print(sep)
 
     if not h.empty:
         print(f"\n>> WORK HOLIDAY BLOCKS ({len(h)}):")
-        for _, row in h.sort_values(["start", "customer_id"]).iterrows():
+        for _, r in h.sort_values(["start", "customer_id"]).iterrows():
             print(
-                f"  {row['customer_id']:<12}  {str(row['start'])[:10]} -> "
-                f"{str(row['end'])[:10]}  ({row['length']}d  "
-                f"z={row['mean_z']})"
-            )
-
-    if not w.empty:
-        print(f"\n>> WEIRD WEEKENDS ({len(w)}):")
-        for _, row in w.sort_values(["start", "customer_id"]).iterrows():
-            print(
-                f"  {row['customer_id']:<12}  {str(row['start'])[:10]} -> "
-                f"{str(row['end'])[:10]}  "
-                f"dir={row['direction']:<4}  z={row['weekend_z']:.1f}"
+                f"  {r['customer_id']:<12}  {str(r['start'])[:10]} -> "
+                f"{str(r['end'])[:10]}  ({r['length']}d  z={r['mean_z']})"
             )
 
     if not b.empty:
         print(f"\n>> STRUCTURAL BREAKS ({len(b)}):")
-        for _, row in b.sort_values(["date", "customer_id"]).iterrows():
+        for _, r in b.sort_values(["date", "customer_id"]).iterrows():
             print(
-                f"  {str(row['date'])[:10]:<12}  {row['customer_id']:<12}  "
-                f"{row['direction']:<4}  mag={row['magnitude']}  "
-                f"({row['mean_before']} -> {row['mean_after']})"
+                f"  {str(r['date'])[:10]:<12}  {r['customer_id']:<12}  "
+                f"{r['direction']:<4}  mag={r['magnitude']}  "
+                f"({r['mean_before']} -> {r['mean_after']})"
             )
