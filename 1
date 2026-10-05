@@ -1,37 +1,46 @@
 """
-Anomaly detection for forecast-vs-actual time series across many customers.
+Anomaly detection — paste this file into your Python console as a cell block.
+Detects WORK_HOLIDAY blocks and STRUCTURAL_BREAKS via ruptures PELT.
 
-Detects:
-  1. WORK_HOLIDAY     — consecutive days where actual/forecast ratio is way off
-  2. STRUCTURAL_BREAK — permanent baseline shifts (via ruptures PELT)
+Usage:
+    exec(open("path/to/this_file.py").read())
+    # or just copy-paste the whole thing into the console
 
-Usage
------
-    from anomaly_detector import detect_anomalies, print_report
+Then:
+    # Your exact loop structure:
+    for ax, identifier in zip(axes, identifiers):
+        signal = project["ist_mpe"].dropna()
+        y = signal.values.astype(float)
+        y_scaled = (y - np.median(y)) / (np.std(y) + 1e-8)
 
-    result = detect_anomalies(df)
-    # result['holidays']   — DataFrame of WORK_HOLIDAY blocks
-    # result['breaks']     — DataFrame of STRUCTURAL_BREAK events
-    # result['diagnostics']— per-row flags
+        algo = rpt.Pelt(model="l2")
+        algo.fit(y_scaled)
+        bkps = algo.predict(pen=8)
 
-Input DataFrame
----------------
-  customer_id | date (datetime) | forecast (float) | actual (float)
+        ax.plot(signal.index, y_scaled, linewidth=1)
+        ax.set_title(f"Customer {identifier}")
+
+        # Mark PELT breaks on the plot
+        for bi in bkps[:-1]:
+            if bi < len(signal):
+                ax.axvline(signal.index[bi], color="red", ls="--", alpha=0.5)
+
+    # Or use the full detection:
+    result = detect_anomalies(df)   # df with customer_id, date, forecast, actual
+    holidays = result["holidays"]   # DataFrame of WORK_HOLIDAY blocks
+    breaks = result["breaks"]       # DataFrame of STRUCTURAL_BREAK events
 """
-
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 import ruptures as rpt
 
-
-# ---------------------------------------------------------------------------
+# ===================================================================
 # Helpers
-# ---------------------------------------------------------------------------
+# ===================================================================
 
-
-def _rolling_mad_z(series: pd.Series, window: int) -> pd.Series:
+def _rolling_mad_z(series, window=14):
     roll = series.rolling(window=window, min_periods=max(5, window // 4))
     med = roll.median()
     mad = roll.apply(
@@ -41,9 +50,7 @@ def _rolling_mad_z(series: pd.Series, window: int) -> pd.Series:
 
 
 def _find_blocks(mask, dates, zs, min_run):
-    """Group consecutive True in mask, keep runs >= min_run."""
-    rows, n = [], len(mask)
-    i = 0
+    rows, n, i = [], len(mask), 0
     while i < n:
         if not mask[i]:
             i += 1
@@ -51,47 +58,33 @@ def _find_blocks(mask, dates, zs, min_run):
         j = i
         while j < n and mask[j]:
             j += 1
-        length = j - i
-        if length >= min_run:
+        if j - i >= min_run:
             s = slice(i, j)
-            rows.append(
-                {
-                    "start": dates[i],
-                    "end": dates[j - 1],
-                    "length": length,
-                    "mean_z": round(float(np.mean(np.abs(zs[s]))), 2),
-                    "max_z": round(float(np.max(np.abs(zs[s]))), 2),
-                }
-            )
+            rows.append({
+                "start": dates[i], "end": dates[j - 1],
+                "length": j - i,
+                "mean_z": round(float(np.mean(np.abs(zs[s]))), 2),
+                "max_z": round(float(np.max(np.abs(zs[s]))), 2),
+            })
         i = j
     cols = ["start", "end", "length", "mean_z", "max_z"]
     return pd.DataFrame(rows) if rows else pd.DataFrame(columns=cols)
 
 
-# ---------------------------------------------------------------------------
-# Per-customer analysis
-# ---------------------------------------------------------------------------
-
+# ===================================================================
+# Core: detect anomalies for one customer
+# ===================================================================
 
 def analyze_customer(
-    df: pd.DataFrame,
-    freq: str = "D",
-    ratio_thresh: float = 0.5,
-    min_consecutive: int = 3,
-    break_penalty: float = 8.0,
-) -> dict:
+    df,
+    freq="D",
+    ratio_thresh=0.5,
+    min_consecutive=3,
+    break_penalty=8.0,
+):
     """
-    Analyze a single customer's forecast-vs-actual data.
-
-    Parameters
-    ----------
-    df : DataFrame with columns [date, forecast, actual], sorted by date.
-    freq : 'D' or 'h'
-    ratio_thresh : flag point as "off" when |actual/forecast - 1| > thresh
-    min_consecutive : min consecutive off-days to form a WORK_HOLIDAY
-    break_penalty : ruptures PELT penalty (higher = fewer breaks)
-
-    Returns dict with keys: holidays, breaks, diagnostics, bkps
+    Returns dict with keys: holidays, breaks, diagnostics, bkps.
+    df must have columns: date, forecast, actual (sorted by date).
     """
     n = len(df)
     f = df["forecast"].to_numpy().astype(float)
@@ -99,32 +92,25 @@ def analyze_customer(
     dates = df["date"].to_numpy()
 
     resid = a - f
-    ratio = np.where(np.abs(f) > 1e-9, a / f, np.where(np.abs(a) > 1e-9, 2.0, 1.0))
+    ratio = np.where(
+        np.abs(f) > 1e-9, a / f,
+        np.where(np.abs(a) > 1e-9, 2.0, 1.0),
+    )
 
-    # Rolling z-score on residuals
     win = 28 * 24 if freq == "h" else 14
     zs = _rolling_mad_z(pd.Series(resid, index=df.index), window=win).to_numpy()
 
-    # ---- 1. WORK HOLIDAY (ratio-based) ----
+    # ---- 1. WORK HOLIDAY (ratio-based consecutive off-days) ----
     ratio_off = (ratio < 1 - ratio_thresh) | (ratio > 1 + ratio_thresh)
 
     if freq == "h":
         days = pd.Series(dates).dt.normalize().to_numpy()
         day_df = pd.DataFrame({"d": days, "off": ratio_off})
-        daily = (
-            day_df.groupby("d")
-            .agg(total=("off", "size"), off_count=("off", "sum"))
-            .reset_index()
-        )
-        daily["is_off"] = (daily["off_count"] >= 2) & (
-            daily["off_count"] >= 0.5 * daily["total"]
-        )
-        day_dates = daily["d"].to_numpy()
-        day_off = daily["is_off"].to_numpy()
-        day_z = (
-            day_df.assign(az=np.abs(zs)).groupby("d")["az"].max().to_numpy()
-        )
-        holiday_blocks = _find_blocks(day_off, day_dates, day_z, min_consecutive)
+        daily = day_df.groupby("d").agg(total=("off", "size"), off_count=("off", "sum")).reset_index()
+        daily["is_off"] = (daily["off_count"] >= 2) & (daily["off_count"] >= 0.5 * daily["total"])
+        holiday_blocks = _find_blocks(daily["is_off"].to_numpy(), daily["d"].to_numpy(),
+                                      day_df.assign(az=np.abs(zs)).groupby("d")["az"].max().to_numpy(),
+                                      min_consecutive)
         in_holiday = np.zeros(n, dtype=bool)
         for _, r in holiday_blocks.iterrows():
             in_holiday |= (days >= r["start"]) & (days <= r["end"])
@@ -139,83 +125,59 @@ def analyze_customer(
         holidays_out = holiday_blocks.copy()
         holidays_out["type"] = "WORK_HOLIDAY"
 
-    # ---- 2. STRUCTURAL BREAK via ruptures PELT ----
+    # ---- 2. STRUCTURAL BREAK (ruptures PELT on scaled residual) ----
+    # **Your exact snippet's scaling:**
     y_scaled = (resid - np.median(resid)) / (np.std(resid) + 1e-8)
 
     algo = rpt.Pelt(model="l2")
     algo.fit(y_scaled)
     bkps = algo.predict(pen=break_penalty)
-    break_indices = bkps[:-1]  # last element is n (endpoint)
+    break_indices = bkps[:-1]
 
     breaks_out = pd.DataFrame()
     if len(break_indices) > 0:
+        scale = float(np.median(np.abs(f))) or 1.0
         rows = []
-        scale = float(np.median(np.abs(f))) if float(np.median(np.abs(f))) > 0 else 1.0
         for bi in break_indices:
             if bi < 2 or bi >= n - 2:
                 continue
-            before = resid[max(0, bi - 21) : bi]
-            after = resid[bi : min(n, bi + 21)]
-            med_before = float(np.median(before)) if len(before) else 0.0
-            med_after = float(np.median(after)) if len(after) else 0.0
-            if abs(med_after - med_before) < 0.05 * scale:
-                continue
-            rows.append(
-                {
-                    "date": dates[bi],
-                    "type": "STRUCTURAL_BREAK",
-                    "direction": "up" if med_after > med_before else "down",
-                    "magnitude": round(abs(med_after - med_before), 2),
-                    "mean_before": round(med_before, 2),
-                    "mean_after": round(med_after, 2),
-                }
-            )
+            before = resid[max(0, bi - 21): bi]
+            after = resid[bi: min(n, bi + 21)]
+            mb = float(np.median(before)) if len(before) else 0.0
+            ma = float(np.median(after)) if len(after) else 0.0
+            if abs(ma - mb) >= 0.05 * scale:
+                rows.append({
+                    "date": dates[bi], "type": "STRUCTURAL_BREAK",
+                    "direction": "up" if ma > mb else "down",
+                    "magnitude": round(abs(ma - mb), 2),
+                    "mean_before": round(mb, 2), "mean_after": round(ma, 2),
+                })
         breaks_out = pd.DataFrame(rows) if rows else pd.DataFrame()
 
-    # ---- Diagnostics ----
-    diagnostics = df[["date", "forecast", "actual"]].copy()
-    diagnostics["residual"] = resid.round(2)
-    diagnostics["ratio"] = ratio.round(3)
-    diagnostics["zscore"] = zs.round(2)
-    diagnostics["is_off"] = ratio_off
-    diagnostics["is_holiday"] = in_holiday
+    # Diagnostics
+    diag = df[["date", "forecast", "actual"]].copy()
+    diag["residual"] = resid.round(2)
+    diag["ratio"] = ratio.round(3)
+    diag["zscore"] = zs.round(2)
+    diag["is_off"] = ratio_off
+    diag["is_holiday"] = in_holiday
 
-    return {
-        "holidays": holidays_out,
-        "breaks": breaks_out,
-        "diagnostics": diagnostics,
-        "bkps": break_indices,
-    }
+    return {"holidays": holidays_out, "breaks": breaks_out,
+            "diagnostics": diag, "bkps": break_indices}
 
 
-# ---------------------------------------------------------------------------
+# ===================================================================
 # Multi-customer wrapper
-# ---------------------------------------------------------------------------
-
+# ===================================================================
 
 def detect_anomalies(
-    df: pd.DataFrame,
-    freq: str = "D",
-    ratio_thresh: float = 0.5,
-    min_consecutive: int = 3,
-    break_penalty: float = 8.0,
-) -> dict:
-    """
-    Run anomaly detection across all customers in a DataFrame.
-
-    Parameters
-    ----------
-    df : DataFrame with columns [customer_id, date, forecast, actual]
-    freq : 'D' or 'h'
-    ratio_thresh : threshold for |actual/forecast - 1|
-    min_consecutive : min off-days for a WORK_HOLIDAY block
-    break_penalty : ruptures PELT penalty (default 8.0)
-
-    Returns dict with keys:
-        'holidays'   — all WORK_HOLIDAY blocks concatenated
-        'breaks'     — all STRUCTURAL_BREAK events concatenated
-        'diagnostics'— per-row data with flags
-    """
+    df,
+    freq="D",
+    ratio_thresh=0.5,
+    min_consecutive=3,
+    break_penalty=8.0,
+):
+    """Run analyze_customer for every customer_id in df."""
     required = {"customer_id", "date", "forecast", "actual"}
     missing = required - set(df.columns)
     if missing:
@@ -229,125 +191,84 @@ def detect_anomalies(
 
     for cid, grp in df.groupby("customer_id", sort=False):
         grp = grp.reset_index(drop=True)
-        out = analyze_customer(
-            grp, freq, ratio_thresh, min_consecutive, break_penalty,
-        )
+        out = analyze_customer(grp, freq, ratio_thresh, min_consecutive, break_penalty)
+
         d = out["diagnostics"].copy()
         d["customer_id"] = cid
         all_diag.append(d)
+
         if not out["holidays"].empty:
             h = out["holidays"].copy()
             h.insert(0, "customer_id", cid)
             all_holidays.append(h)
+
         if not out["breaks"].empty:
             b = out["breaks"].copy()
             b.insert(0, "customer_id", cid)
             all_breaks.append(b)
 
     return {
-        "holidays": pd.concat(all_holidays, ignore_index=True)
-        if all_holidays
-        else pd.DataFrame(),
-        "breaks": pd.concat(all_breaks, ignore_index=True)
-        if all_breaks
-        else pd.DataFrame(),
-        "diagnostics": pd.concat(all_diag, ignore_index=True)
-        if all_diag
-        else pd.DataFrame(),
+        "holidays": pd.concat(all_holidays, ignore_index=True) if all_holidays else pd.DataFrame(),
+        "breaks": pd.concat(all_breaks, ignore_index=True) if all_breaks else pd.DataFrame(),
+        "diagnostics": pd.concat(all_diag, ignore_index=True) if all_diag else pd.DataFrame(),
     }
 
 
-# ---------------------------------------------------------------------------
-# Plotting
-# ---------------------------------------------------------------------------
+# ===================================================================
+# Report
+# ===================================================================
 
-
-def plot_customer(
-    result: dict,
-    customer_id: str,
-    save: str | None = None,
-    figsize=(14, 5),
-):
-    """Plot one customer: scaled residual + PELT break lines + holiday bands."""
-    import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
-
-    diag = result["diagnostics"]
-    cust = diag[diag["customer_id"] == customer_id].copy()
-    if cust.empty:
-        print(f"No data for customer '{customer_id}'")
-        return
-
-    fig, ax = plt.subplots(figsize=figsize)
-
-    y = cust["residual"].values.astype(float)
-    y_scaled = (y - np.median(y)) / (np.std(y) + 1e-8)
-    ax.plot(cust["date"], y_scaled, "b-", linewidth=0.8, label="Scaled residual")
-
-    # PELT breaks
-    ys = (y - np.median(y)) / (np.std(y) + 1e-8)
-    algo = rpt.Pelt(model="l2").fit(ys)
-    bkps = algo.predict(pen=8)[:-1]
-    for bi in bkps:
-        if bi < len(cust):
-            ax.axvline(cust["date"].iloc[bi], color="red", linestyle="--",
-                       linewidth=1, alpha=0.7)
-    if bkps:
-        ax.text(0.02, 0.95, f"PELT breaks: {len(bkps)}",
-                transform=ax.transAxes, fontsize=9, va="top",
-                bbox=dict(facecolor="wheat", alpha=0.7))
-
-    # Holiday bands
-    holidays = result["holidays"]
-    if not holidays.empty:
-        for _, row in holidays[holidays["customer_id"] == customer_id].iterrows():
-            ax.axvspan(row["start"], row["end"], color="green", alpha=0.15)
-
-    # Structural breaks
-    breaks = result["breaks"]
-    if not breaks.empty:
-        for _, row in breaks[breaks["customer_id"] == customer_id].iterrows():
-            ax.axvline(row["date"], color="red", linewidth=2, alpha=0.8)
-
-    ax.axhline(0, color="gray", linewidth=0.5)
-    ax.set_title(f"Customer {customer_id}")
-    ax.set_ylabel("Scaled residual")
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
-    ax.legend(fontsize=8, loc="upper right")
-    plt.tight_layout()
-
-    if save:
-        plt.savefig(save, dpi=150)
-        print(f"Saved to {save}")
-    else:
-        plt.show()
-    plt.close()
-
-
-def print_report(result: dict) -> None:
-    """Pretty-print all detected anomalies."""
+def print_report(result):
     h, b, d = result["holidays"], result["breaks"], result["diagnostics"]
-    n_cust = d["customer_id"].nunique() if not d.empty else 0
-    sep = "=" * 72
-    print(sep)
-    print(f"  CUSTOMERS:         {n_cust}")
+    nc = d["customer_id"].nunique() if not d.empty else 0
+    print("=" * 72)
+    print(f"  CUSTOMERS:         {nc}")
     print(f"  WORK HOLIDAYS:     {len(h)}")
     print(f"  STRUCTURAL BREAKS: {len(b)}")
-    print(sep)
-
+    print("=" * 72)
     if not h.empty:
         print(f"\n>> WORK HOLIDAY BLOCKS ({len(h)}):")
         for _, r in h.sort_values(["start", "customer_id"]).iterrows():
-            print(
-                f"  {r['customer_id']:<12}  {str(r['start'])[:10]} -> "
-                f"{str(r['end'])[:10]}  ({r['length']}d  z={r['mean_z']})"
-            )
-
+            print(f"  {r['customer_id']:<12}  {str(r['start'])[:10]} -> {str(r['end'])[:10]}  ({r['length']}d  z={r['mean_z']})")
     if not b.empty:
         print(f"\n>> STRUCTURAL BREAKS ({len(b)}):")
         for _, r in b.sort_values(["date", "customer_id"]).iterrows():
-            print(
-                f"  {str(r['date'])[:10]:<12}  {r['customer_id']:<12}  "
-                f"{r['direction']:<4}  mag={r['magnitude']}  "
-                f"({r['mean_before']} -> {r['mean_after']})"
-            )
+            print(f"  {str(r['date'])[:10]:<12}  {r['customer_id']:<12}  {r['direction']:<4}  mag={r['magnitude']}  ({r['mean_before']} -> {r['mean_after']})")
+
+
+# ===================================================================
+# Your exact loop structure — ready to use
+# ===================================================================
+# Paste this into your console after running the cell above:
+#
+# for ax, identifier in zip(axes, identifiers):
+#     signal = project["ist_mpe"].dropna()
+#     y = signal.values.astype(float)
+#     y_scaled = (y - np.median(y)) / (np.std(y) + 1e-8)
+#
+#     algo = rpt.Pelt(model="l2")
+#     algo.fit(y_scaled)
+#     bkps = algo.predict(pen=8)
+#
+#     ax.plot(signal.index, y_scaled, linewidth=1)
+#     ax.set_title(f"Customer {identifier}")
+#
+#     # Mark breaks
+#     for bi in bkps[:-1]:
+#         if bi < len(signal):
+#             ax.axvline(signal.index[bi], color="red", ls="--", alpha=0.5)
+
+print("anomaly_detector loaded. Ready to use.")
+print()
+print("  result = detect_anomalies(df)")
+print("  print_report(result)")
+print()
+print("  # Or your own loop:")
+print("  for ax, identifier in zip(axes, identifiers):")
+print("      signal = project['ist_mpe'].dropna()")
+print("      y = signal.values.astype(float)")
+print("      y_scaled = (y - np.median(y)) / (np.std(y) + 1e-8)")
+print("      algo = rpt.Pelt(model='l2')")
+print("      algo.fit(y_scaled)")
+print("      bkps = algo.predict(pen=8)")
+print("      ax.plot(signal.index, y_scaled)")
